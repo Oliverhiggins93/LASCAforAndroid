@@ -1,9 +1,11 @@
 package com.hfad.yoloandroid;
 
 import android.graphics.Bitmap;
+import android.graphics.Camera;
 import android.os.Environment;
 import android.support.v7.app.AppCompatActivity;
 import android.os.Bundle;
+import android.util.Log;
 import android.view.SurfaceView;
 import android.view.View;
 import android.widget.Toast;
@@ -36,15 +38,22 @@ import static org.opencv.core.CvType.CV_16U;
 import static org.opencv.core.CvType.CV_32F;
 import static org.opencv.core.CvType.CV_64F;
 import static org.opencv.core.CvType.CV_8U;
+import static org.opencv.core.CvType.CV_8UC3;
+import static org.opencv.core.CvType.CV_8UC4;
 
 public class MainActivity extends AppCompatActivity implements CameraBridgeViewBase.CvCameraViewListener2 {
 
     CameraBridgeViewBase cameraBridgeViewBase;
     BaseLoaderCallback baseLoaderCallback;
 
-    Mat lascaFrame, frame, avfilter, framemean, frame2mean;
-    List<Mat> allChannels;
-
+    Mat lascaFrame, frame, avfilter, framemean, frame2mean, prevLascaFrame, averageLascaFrame, norm_m_calc1, norm_m_calc2, norm_m, dyn_calc1, dyn_calc2, dyn_contrast;
+    Camera mCamera;
+    List<Mat> frameAccumulator;
+    //window size for moving averages
+    int wsize = 5;
+    int framestoaverage = 30;
+    //count integer for accumulator
+    int count = 0;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -54,7 +63,10 @@ public class MainActivity extends AppCompatActivity implements CameraBridgeViewB
         cameraBridgeViewBase = (JavaCameraView)findViewById(R.id.CameraView);
         cameraBridgeViewBase.setVisibility(SurfaceView.VISIBLE);
         cameraBridgeViewBase.setCvCameraViewListener(this);
-
+        cameraBridgeViewBase.setMinimumHeight(3024);
+        cameraBridgeViewBase.setMinimumWidth(4032);
+        cameraBridgeViewBase.setMaxFrameSize(4032, 3024);
+        cameraBridgeViewBase.setCameraIndex(-1);
 
         //next lines of code check that everything loads correctly with a switch case
         //if loaded correctly we enable the view
@@ -74,64 +86,121 @@ public class MainActivity extends AppCompatActivity implements CameraBridgeViewB
         };
     }
 
-    private Mat getLASCA(Mat singleChannel) {
+    private void getLASCA(Mat inputMat) {
+        //The input here is just inputFrame.rgba(); from the onCameraFrame method
+        prevLascaFrame = lascaFrame;
+        Core.extractChannel(frame, frame, 0);
+        Core.normalize(frame, frame, 0,1, Core.NORM_MINMAX, CvType.CV_64F);
+        //local blur
+        Imgproc.blur(frame, framemean, new Size(wsize,wsize), new Point(-1,-1));
+        Imgproc.GaussianBlur(frame, frame2mean, new Size(wsize,wsize), 0);
+        Core.divide(frame2mean, framemean, lascaFrame);
+        Core.addWeighted(lascaFrame, 0.5, prevLascaFrame, 0.5, 0, lascaFrame, CV_64F);
+        Core.normalize(lascaFrame, lascaFrame, 0, 255, Core.NORM_MINMAX, CV_8U);
+        Imgproc.applyColorMap(lascaFrame, lascaFrame, 2);
+    }
 
-        Imgproc.blur(singleChannel, avfilter, new Size(5,5), new Point(-1,-1));
+    public void getLASCAAverage(Mat inputmat){
+        Core.extractChannel(frame, frame, 0);
+        Core.normalize(frame, frame, 0,1, Core.NORM_MINMAX, CvType.CV_64F);
 
+        Imgproc.blur(frame, framemean, new Size(wsize,wsize), new Point(-1,-1));
+        Core.multiply(frame, frame, frame2mean);
+        Imgproc.blur(frame, frame2mean, new Size(wsize,wsize), new Point(-1,-1));
+        Core.sqrt(framemean, framemean);
+        //Core.subtract(framemean, new Scalar(1), framemean);
+        Core.divide(frame2mean, framemean, lascaFrame);
+        Core.sqrt(lascaFrame, lascaFrame);
+        //we not have our lasca frame so we can average them over time
 
-        return avfilter;
+        frameAccumulator.set(count, lascaFrame);
+        count = count + 1;
+        if (count == framestoaverage){
+            count = 0;
+            averageLascaFrame.setTo(new Scalar(0));
+            //Core.add(averageLascaFrame, new Scalar(0.01), averageLascaFrame);
+        }
 
-
+        for (int i = 0; i < framestoaverage; i++) {
+            //Imgproc.accumulateWeighted(frameAccumulator.get(i), averageLascaFrame, 0.1);
+            Imgproc.accumulate(frameAccumulator.get(i), averageLascaFrame);
+        }
+        Core.normalize(averageLascaFrame, frame, 0, 255, Core.NORM_MINMAX, CV_8U);
+        Imgproc.applyColorMap(frame, frame, 2);
     }
 
     @Override
     public Mat onCameraFrame(CameraBridgeViewBase.CvCameraViewFrame inputFrame) {
-        //gets triggered 20 or 30 times a second
-        //this is where we do any maths on our camera
-        //java has no numpy so we use matrix objects
-        //going to calculate the lasca here as it seems to prevent memory leaks
+        //gets triggered 20 or 30 times a second. This is where we do any maths on our camera
+
         frame = inputFrame.rgba();
-
-        //extract red channel
         Core.extractChannel(frame, frame, 0);
-        Core.normalize(frame, frame, 0,1, Core.NORM_MINMAX, CvType.CV_64F);
-        //local blur
-        int wsize = 21;
-        Imgproc.blur(frame, framemean, new Size(wsize,wsize), new Point(-1,-1));
-        Imgproc.GaussianBlur(frame, frame2mean, new Size(wsize,wsize), 0);
-        Core.divide(frame2mean, framemean, lascaFrame);
+        frame.convertTo(frame, CV_64F);
+        frameAccumulator.set(count, frame);
 
-        Core.normalize(lascaFrame, lascaFrame, 0, 255, Core.NORM_MINMAX, CV_8U);
-        Imgproc.applyColorMap(lascaFrame, lascaFrame, 2);
+        for (int i = 0; i < framestoaverage - 1; i++) {
+            //Imgproc.accumulateWeighted(frameAccumulator.get(i), averageLascaFrame, 0.1);
+            Imgproc.accumulate(frameAccumulator.get(i), norm_m_calc1);
+        }
+        Core.divide(norm_m_calc1, new Scalar(framestoaverage), norm_m_calc1);
+        for (int i = 1; i < framestoaverage; i++) {
+            //Imgproc.accumulateWeighted(frameAccumulator.get(i), averageLascaFrame, 0.1);
+            Imgproc.accumulate(frameAccumulator.get(i), norm_m_calc2);
+        }
+        Core.divide(norm_m_calc2, new Scalar(framestoaverage), norm_m_calc2);
+        dyn_calc1 = norm_m_calc1.clone();
+        dyn_calc2 = norm_m_calc2.clone();
+        Imgproc.blur(norm_m_calc1, norm_m_calc1, new Size(wsize,wsize), new Point(-1,-1));
+        Imgproc.blur(norm_m_calc2, norm_m_calc2, new Size(wsize,wsize), new Point(-1,-1));
+        Core.multiply(norm_m_calc1, norm_m_calc2, norm_m);
 
-        //local blur for squared version
+        //calculate dynamic part
+        Core.subtract(dyn_calc2, dyn_calc1, dyn_calc1);
+        Core.multiply(dyn_calc1, dyn_calc1, dyn_calc1);
+        Core.divide(dyn_calc1, new Scalar(2), dyn_calc1);
+        Core.divide(dyn_calc1, new Scalar(0.4252), dyn_calc1);
+        Imgproc.threshold(dyn_calc1, dyn_calc1, 0.001, 1, Imgproc.THRESH_TOZERO);
+        Core.normalize(dyn_calc1, frame, 0, 255, Core.NORM_MINMAX, CV_8U);
+        Imgproc.applyColorMap(frame, frame, 2);
+
+
+        //Imgproc.blur(frame, framemean, new Size(wsize,wsize), new Point(-1,-1));
         //Core.multiply(frame, frame, frame2mean);
-        //Imgproc.blur(frame2mean, frame2mean, new Size(5,5), new Point(-1,-1));
-        //calculate local contrast
-        //Core.multiply(framemean, framemean, framemean);
+        //Imgproc.blur(frame, frame2mean, new Size(wsize,wsize), new Point(-1,-1));
+        //Core.sqrt(framemean, framemean);
         //Core.subtract(framemean, new Scalar(1), framemean);
         //Core.divide(frame2mean, framemean, lascaFrame);
-        //Core.normalize(lascaFrame, lascaFrame, 0, 255, Core.NORM_MINMAX, CV_8U);
-        //Imgproc.applyColorMap(lascaFrame, lascaFrame, 2);
+        //Core.sqrt(lascaFrame, lascaFrame);
+        //we not have our lasca frame so we can average them over time
 
-
-
-        //Mat tmp = new Mat (1080, 1920, CvType.CV_8U, new Scalar(4));
-        //Bitmap bmp = Bitmap.createBitmap(1920, 1080, Bitmap.Config.ARGB_8888);
-
-        //Utils.matToBitmap(tmp, bmp);
-
-        return lascaFrame;
+        return inputFrame.rgba();
+        //return frame;
     }
 
     @Override
     public void onCameraViewStarted(int width, int height) {
-        allChannels = new ArrayList<>(3);
-        lascaFrame = new Mat(1080, 1920, CV_64F);
-        frame = new Mat(1080, 1920, CV_64F);
-        avfilter = new Mat(1080, 1920, CV_64F);
-        framemean = new Mat(1080, 1920, CV_64F);
-        frame2mean = new Mat(1080, 1920, CV_64F);
+
+        int rowsize = 1080;
+        int colsize = 1920;
+        lascaFrame = new Mat(rowsize, colsize, CV_64F);
+        frame = new Mat(rowsize, colsize, CV_64F);
+        avfilter = new Mat(rowsize, colsize, CV_64F);
+        framemean = new Mat(rowsize, colsize, CV_64F);
+        frame2mean = new Mat(rowsize, colsize, CV_64F);
+        averageLascaFrame = new Mat(rowsize, colsize, CV_64F);
+        norm_m = new Mat(rowsize, colsize, CV_64F);
+        norm_m_calc1 = new Mat(rowsize, colsize, CV_64F);
+        norm_m_calc2 = new Mat(rowsize, colsize, CV_64F);
+        dyn_calc1 = new Mat(rowsize, colsize, CV_64F);
+        dyn_calc2 = new Mat(rowsize, colsize, CV_64F);
+        dyn_contrast = new Mat(rowsize, colsize, CV_64F);
+
+        frameAccumulator = new ArrayList<Mat>();
+        for (int i = 0; i < framestoaverage; i ++) {
+        frameAccumulator.add(frame);
+        }
+
+
 
 
 
